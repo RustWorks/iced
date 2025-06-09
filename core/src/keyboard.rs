@@ -1,8 +1,11 @@
-//! Reuse basic keyboard types.
+//! Listen to keyboard events.
+pub mod key;
+
 mod event;
-mod key_code;
-mod modifiers_state;
+mod location;
+mod modifiers;
 
 pub use event::Event;
-pub use key_code::KeyCode;
-pub use modifiers_state::ModifiersState;
+pub use key::Key;
+pub use location::Location;
+pub use modifiers::Modifiers;

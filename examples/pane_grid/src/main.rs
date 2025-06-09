@@ -1,16 +1,20 @@
-use iced::{
-    button, keyboard, pane_grid, scrollable, Align, Button, Column, Container,
-    Element, HorizontalAlignment, Length, PaneGrid, Sandbox, Scrollable,
-    Settings, Text,
+use iced::keyboard;
+use iced::widget::pane_grid::{self, PaneGrid};
+use iced::widget::{
+    button, center_y, column, container, responsive, row, scrollable, text,
 };
+use iced::{Center, Color, Element, Fill, Size, Subscription};
 
-pub fn main() {
-    Example::run(Settings::default())
+pub fn main() -> iced::Result {
+    iced::application(Example::default, Example::update, Example::view)
+        .subscription(Example::subscription)
+        .run()
 }
 
 struct Example {
-    panes: pane_grid::State<Content>,
+    panes: pane_grid::State<Pane>,
     panes_created: usize,
+    focus: Option<pane_grid::Pane>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -18,312 +22,362 @@ enum Message {
     Split(pane_grid::Axis, pane_grid::Pane),
     SplitFocused(pane_grid::Axis),
     FocusAdjacent(pane_grid::Direction),
+    Clicked(pane_grid::Pane),
     Dragged(pane_grid::DragEvent),
     Resized(pane_grid::ResizeEvent),
+    TogglePin(pane_grid::Pane),
+    Maximize(pane_grid::Pane),
+    Restore,
     Close(pane_grid::Pane),
     CloseFocused,
 }
 
-impl Sandbox for Example {
-    type Message = Message;
-
+impl Example {
     fn new() -> Self {
-        let (panes, _) = pane_grid::State::new(Content::new(0));
+        let (panes, _) = pane_grid::State::new(Pane::new(0));
 
         Example {
             panes,
             panes_created: 1,
+            focus: None,
         }
-    }
-
-    fn title(&self) -> String {
-        String::from("Pane grid - Iced")
     }
 
     fn update(&mut self, message: Message) {
         match message {
             Message::Split(axis, pane) => {
-                let _ = self.panes.split(
-                    axis,
-                    &pane,
-                    Content::new(self.panes_created),
-                );
+                let result =
+                    self.panes.split(axis, pane, Pane::new(self.panes_created));
+
+                if let Some((pane, _)) = result {
+                    self.focus = Some(pane);
+                }
 
                 self.panes_created += 1;
             }
             Message::SplitFocused(axis) => {
-                if let Some(pane) = self.panes.active() {
-                    let _ = self.panes.split(
+                if let Some(pane) = self.focus {
+                    let result = self.panes.split(
                         axis,
-                        &pane,
-                        Content::new(self.panes_created),
+                        pane,
+                        Pane::new(self.panes_created),
                     );
+
+                    if let Some((pane, _)) = result {
+                        self.focus = Some(pane);
+                    }
 
                     self.panes_created += 1;
                 }
             }
             Message::FocusAdjacent(direction) => {
-                if let Some(pane) = self.panes.active() {
-                    if let Some(adjacent) =
-                        self.panes.adjacent(&pane, direction)
+                if let Some(pane) = self.focus {
+                    if let Some(adjacent) = self.panes.adjacent(pane, direction)
                     {
-                        self.panes.focus(&adjacent);
+                        self.focus = Some(adjacent);
                     }
                 }
             }
+            Message::Clicked(pane) => {
+                self.focus = Some(pane);
+            }
             Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
-                self.panes.resize(&split, ratio);
+                self.panes.resize(split, ratio);
             }
             Message::Dragged(pane_grid::DragEvent::Dropped {
                 pane,
                 target,
             }) => {
-                self.panes.swap(&pane, &target);
+                self.panes.drop(pane, target);
             }
             Message::Dragged(_) => {}
+            Message::TogglePin(pane) => {
+                if let Some(Pane { is_pinned, .. }) = self.panes.get_mut(pane) {
+                    *is_pinned = !*is_pinned;
+                }
+            }
+            Message::Maximize(pane) => self.panes.maximize(pane),
+            Message::Restore => {
+                self.panes.restore();
+            }
             Message::Close(pane) => {
-                let _ = self.panes.close(&pane);
+                if let Some((_, sibling)) = self.panes.close(pane) {
+                    self.focus = Some(sibling);
+                }
             }
             Message::CloseFocused => {
-                if let Some(pane) = self.panes.active() {
-                    let _ = self.panes.close(&pane);
+                if let Some(pane) = self.focus {
+                    if let Some(Pane { is_pinned, .. }) = self.panes.get(pane) {
+                        if !is_pinned {
+                            if let Some((_, sibling)) = self.panes.close(pane) {
+                                self.focus = Some(sibling);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn view(&mut self) -> Element<Message> {
+    fn subscription(&self) -> Subscription<Message> {
+        keyboard::on_key_press(|key_code, modifiers| {
+            if !modifiers.command() {
+                return None;
+            }
+
+            handle_hotkey(key_code)
+        })
+    }
+
+    fn view(&self) -> Element<Message> {
+        let focus = self.focus;
         let total_panes = self.panes.len();
 
-        let pane_grid =
-            PaneGrid::new(&mut self.panes, |pane, content, focus| {
-                let is_focused = focus.is_some();
-                let title_bar =
-                    pane_grid::TitleBar::new(format!("Pane {}", content.id))
-                        .padding(10)
-                        .style(style::TitleBar { is_focused });
+        let pane_grid = PaneGrid::new(&self.panes, |id, pane, is_maximized| {
+            let is_focused = focus == Some(id);
 
-                pane_grid::Content::new(content.view(pane, total_panes))
-                    .title_bar(title_bar)
-                    .style(style::Pane { is_focused })
+            let pin_button = button(
+                text(if pane.is_pinned { "Unpin" } else { "Pin" }).size(14),
+            )
+            .on_press(Message::TogglePin(id))
+            .padding(3);
+
+            let title = row![
+                pin_button,
+                "Pane",
+                text(pane.id.to_string()).color(if is_focused {
+                    PANE_ID_COLOR_FOCUSED
+                } else {
+                    PANE_ID_COLOR_UNFOCUSED
+                }),
+            ]
+            .spacing(5);
+
+            let title_bar = pane_grid::TitleBar::new(title)
+                .controls(pane_grid::Controls::dynamic(
+                    view_controls(
+                        id,
+                        total_panes,
+                        pane.is_pinned,
+                        is_maximized,
+                    ),
+                    button(text("X").size(14))
+                        .style(button::danger)
+                        .padding(3)
+                        .on_press_maybe(
+                            if total_panes > 1 && !pane.is_pinned {
+                                Some(Message::Close(id))
+                            } else {
+                                None
+                            },
+                        ),
+                ))
+                .padding(10)
+                .style(if is_focused {
+                    style::title_bar_focused
+                } else {
+                    style::title_bar_active
+                });
+
+            pane_grid::Content::new(responsive(move |size| {
+                view_content(id, total_panes, pane.is_pinned, size)
+            }))
+            .title_bar(title_bar)
+            .style(if is_focused {
+                style::pane_focused
+            } else {
+                style::pane_active
             })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .spacing(10)
-            .on_drag(Message::Dragged)
-            .on_resize(10, Message::Resized)
-            .on_key_press(handle_hotkey);
+        })
+        .width(Fill)
+        .height(Fill)
+        .spacing(10)
+        .on_click(Message::Clicked)
+        .on_drag(Message::Dragged)
+        .on_resize(10, Message::Resized);
 
-        Container::new(pane_grid)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(10)
-            .into()
+        container(pane_grid).padding(10).into()
     }
 }
 
-fn handle_hotkey(event: pane_grid::KeyPressEvent) -> Option<Message> {
-    use keyboard::KeyCode;
+impl Default for Example {
+    fn default() -> Self {
+        Example::new()
+    }
+}
+
+const PANE_ID_COLOR_UNFOCUSED: Color = Color::from_rgb(
+    0xFF as f32 / 255.0,
+    0xC7 as f32 / 255.0,
+    0xC7 as f32 / 255.0,
+);
+const PANE_ID_COLOR_FOCUSED: Color = Color::from_rgb(
+    0xFF as f32 / 255.0,
+    0x47 as f32 / 255.0,
+    0x47 as f32 / 255.0,
+);
+
+fn handle_hotkey(key: keyboard::Key) -> Option<Message> {
+    use keyboard::key::{self, Key};
     use pane_grid::{Axis, Direction};
 
-    let direction = match event.key_code {
-        KeyCode::Up => Some(Direction::Up),
-        KeyCode::Down => Some(Direction::Down),
-        KeyCode::Left => Some(Direction::Left),
-        KeyCode::Right => Some(Direction::Right),
-        _ => None,
-    };
+    match key.as_ref() {
+        Key::Character("v") => Some(Message::SplitFocused(Axis::Vertical)),
+        Key::Character("h") => Some(Message::SplitFocused(Axis::Horizontal)),
+        Key::Character("w") => Some(Message::CloseFocused),
+        Key::Named(key) => {
+            let direction = match key {
+                key::Named::ArrowUp => Some(Direction::Up),
+                key::Named::ArrowDown => Some(Direction::Down),
+                key::Named::ArrowLeft => Some(Direction::Left),
+                key::Named::ArrowRight => Some(Direction::Right),
+                _ => None,
+            };
 
-    match event.key_code {
-        KeyCode::V => Some(Message::SplitFocused(Axis::Vertical)),
-        KeyCode::H => Some(Message::SplitFocused(Axis::Horizontal)),
-        KeyCode::W => Some(Message::CloseFocused),
-        _ => direction.map(Message::FocusAdjacent),
+            direction.map(Message::FocusAdjacent)
+        }
+        _ => None,
     }
 }
 
-struct Content {
+#[derive(Clone, Copy)]
+struct Pane {
     id: usize,
-    scroll: scrollable::State,
-    split_horizontally: button::State,
-    split_vertically: button::State,
-    close: button::State,
+    pub is_pinned: bool,
 }
 
-impl Content {
+impl Pane {
     fn new(id: usize) -> Self {
-        Content {
+        Self {
             id,
-            scroll: scrollable::State::new(),
-            split_horizontally: button::State::new(),
-            split_vertically: button::State::new(),
-            close: button::State::new(),
+            is_pinned: false,
         }
     }
-    fn view(
-        &mut self,
-        pane: pane_grid::Pane,
-        total_panes: usize,
-    ) -> Element<Message> {
-        let Content {
-            scroll,
-            split_horizontally,
-            split_vertically,
-            close,
-            ..
-        } = self;
+}
 
-        let button = |state, label, message, style| {
-            Button::new(
-                state,
-                Text::new(label)
-                    .width(Length::Fill)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .size(16),
-            )
-            .width(Length::Fill)
+fn view_content<'a>(
+    pane: pane_grid::Pane,
+    total_panes: usize,
+    is_pinned: bool,
+    size: Size,
+) -> Element<'a, Message> {
+    let button = |label, message| {
+        button(text(label).width(Fill).align_x(Center).size(16))
+            .width(Fill)
             .padding(8)
             .on_press(message)
-            .style(style)
+    };
+
+    let controls = column![
+        button(
+            "Split horizontally",
+            Message::Split(pane_grid::Axis::Horizontal, pane),
+        ),
+        button(
+            "Split vertically",
+            Message::Split(pane_grid::Axis::Vertical, pane),
+        )
+    ]
+    .push_maybe(if total_panes > 1 && !is_pinned {
+        Some(button("Close", Message::Close(pane)).style(button::danger))
+    } else {
+        None
+    })
+    .spacing(5)
+    .max_width(160);
+
+    let content =
+        column![text!("{}x{}", size.width, size.height).size(24), controls,]
+            .spacing(10)
+            .align_x(Center);
+
+    center_y(scrollable(content)).padding(5).into()
+}
+
+fn view_controls<'a>(
+    pane: pane_grid::Pane,
+    total_panes: usize,
+    is_pinned: bool,
+    is_maximized: bool,
+) -> Element<'a, Message> {
+    let row = row![].spacing(5).push_maybe(if total_panes > 1 {
+        let (content, message) = if is_maximized {
+            ("Restore", Message::Restore)
+        } else {
+            ("Maximize", Message::Maximize(pane))
         };
 
-        let mut controls = Column::new()
-            .spacing(5)
-            .max_width(150)
-            .push(button(
-                split_horizontally,
-                "Split horizontally",
-                Message::Split(pane_grid::Axis::Horizontal, pane),
-                style::Button::Primary,
-            ))
-            .push(button(
-                split_vertically,
-                "Split vertically",
-                Message::Split(pane_grid::Axis::Vertical, pane),
-                style::Button::Primary,
-            ));
+        Some(
+            button(text(content).size(14))
+                .style(button::secondary)
+                .padding(3)
+                .on_press(message),
+        )
+    } else {
+        None
+    });
 
-        if total_panes > 1 {
-            controls = controls.push(button(
-                close,
-                "Close",
-                Message::Close(pane),
-                style::Button::Destructive,
-            ));
-        }
+    let close = button(text("Close").size(14))
+        .style(button::danger)
+        .padding(3)
+        .on_press_maybe(if total_panes > 1 && !is_pinned {
+            Some(Message::Close(pane))
+        } else {
+            None
+        });
 
-        let content = Scrollable::new(scroll)
-            .width(Length::Fill)
-            .spacing(10)
-            .align_items(Align::Center)
-            .push(controls);
-
-        Container::new(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(5)
-            .center_y()
-            .into()
-    }
+    row.push(close).into()
 }
 
 mod style {
-    use iced::{button, container, Background, Color, Vector};
+    use iced::widget::container;
+    use iced::{Border, Theme};
 
-    const SURFACE: Color = Color::from_rgb(
-        0xF2 as f32 / 255.0,
-        0xF3 as f32 / 255.0,
-        0xF5 as f32 / 255.0,
-    );
+    pub fn title_bar_active(theme: &Theme) -> container::Style {
+        let palette = theme.extended_palette();
 
-    const ACTIVE: Color = Color::from_rgb(
-        0x72 as f32 / 255.0,
-        0x89 as f32 / 255.0,
-        0xDA as f32 / 255.0,
-    );
-
-    const HOVERED: Color = Color::from_rgb(
-        0x67 as f32 / 255.0,
-        0x7B as f32 / 255.0,
-        0xC4 as f32 / 255.0,
-    );
-
-    pub struct TitleBar {
-        pub is_focused: bool,
-    }
-
-    impl container::StyleSheet for TitleBar {
-        fn style(&self) -> container::Style {
-            let pane = Pane {
-                is_focused: self.is_focused,
-            }
-            .style();
-
-            container::Style {
-                text_color: Some(Color::WHITE),
-                background: Some(pane.border_color.into()),
-                ..Default::default()
-            }
+        container::Style {
+            text_color: Some(palette.background.strong.text),
+            background: Some(palette.background.strong.color.into()),
+            ..Default::default()
         }
     }
 
-    pub struct Pane {
-        pub is_focused: bool,
-    }
+    pub fn title_bar_focused(theme: &Theme) -> container::Style {
+        let palette = theme.extended_palette();
 
-    impl container::StyleSheet for Pane {
-        fn style(&self) -> container::Style {
-            container::Style {
-                background: Some(Background::Color(SURFACE)),
-                border_width: 2,
-                border_color: if self.is_focused {
-                    Color::BLACK
-                } else {
-                    Color::from_rgb(0.7, 0.7, 0.7)
-                },
-                ..Default::default()
-            }
+        container::Style {
+            text_color: Some(palette.primary.strong.text),
+            background: Some(palette.primary.strong.color.into()),
+            ..Default::default()
         }
     }
 
-    pub enum Button {
-        Primary,
-        Destructive,
+    pub fn pane_active(theme: &Theme) -> container::Style {
+        let palette = theme.extended_palette();
+
+        container::Style {
+            background: Some(palette.background.weak.color.into()),
+            border: Border {
+                width: 2.0,
+                color: palette.background.strong.color,
+                ..Border::default()
+            },
+            ..Default::default()
+        }
     }
 
-    impl button::StyleSheet for Button {
-        fn active(&self) -> button::Style {
-            let (background, text_color) = match self {
-                Button::Primary => (Some(ACTIVE), Color::WHITE),
-                Button::Destructive => {
-                    (None, Color::from_rgb8(0xFF, 0x47, 0x47))
-                }
-            };
+    pub fn pane_focused(theme: &Theme) -> container::Style {
+        let palette = theme.extended_palette();
 
-            button::Style {
-                text_color,
-                background: background.map(Background::Color),
-                border_radius: 5,
-                shadow_offset: Vector::new(0.0, 0.0),
-                ..button::Style::default()
-            }
-        }
-
-        fn hovered(&self) -> button::Style {
-            let active = self.active();
-
-            let background = match self {
-                Button::Primary => Some(HOVERED),
-                Button::Destructive => Some(Color {
-                    a: 0.2,
-                    ..active.text_color
-                }),
-            };
-
-            button::Style {
-                background: background.map(Background::Color),
-                ..active
-            }
+        container::Style {
+            background: Some(palette.background.weak.color.into()),
+            border: Border {
+                width: 2.0,
+                color: palette.primary.strong.color,
+                ..Border::default()
+            },
+            ..Default::default()
         }
     }
 }

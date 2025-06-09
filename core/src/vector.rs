@@ -1,23 +1,33 @@
 /// A 2D vector.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vector<T = f32> {
     /// The X component of the [`Vector`]
-    ///
-    /// [`Vector`]: struct.Vector.html
     pub x: T,
 
     /// The Y component of the [`Vector`]
-    ///
-    /// [`Vector`]: struct.Vector.html
     pub y: T,
 }
 
 impl<T> Vector<T> {
     /// Creates a new [`Vector`] with the given components.
-    ///
-    /// [`Vector`]: struct.Vector.html
     pub const fn new(x: T, y: T) -> Self {
         Self { x, y }
+    }
+}
+
+impl Vector {
+    /// The zero [`Vector`].
+    pub const ZERO: Self = Self::new(0.0, 0.0);
+}
+
+impl<T> std::ops::Neg for Vector<T>
+where
+    T: std::ops::Neg<Output = T>,
+{
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self::new(-self.x, -self.y)
     }
 }
 
@@ -63,5 +73,20 @@ where
             x: T::default(),
             y: T::default(),
         }
+    }
+}
+
+impl<T> From<[T; 2]> for Vector<T> {
+    fn from([x, y]: [T; 2]) -> Self {
+        Self::new(x, y)
+    }
+}
+
+impl<T> From<Vector<T>> for [T; 2]
+where
+    T: Copy,
+{
+    fn from(other: Vector<T>) -> Self {
+        [other.x, other.y]
     }
 }

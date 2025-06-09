@@ -1,23 +1,18 @@
-use iced::{
-    button, futures, image, Align, Application, Button, Column, Command,
-    Container, Element, Image, Length, Row, Settings, Text,
-};
+use iced::futures;
+use iced::widget::{self, center, column, image, row, text};
+use iced::{Center, Element, Fill, Right, Task};
 
-pub fn main() {
-    Pokedex::run(Settings::default())
+pub fn main() -> iced::Result {
+    iced::application(Pokedex::new, Pokedex::update, Pokedex::view)
+        .title(Pokedex::title)
+        .run()
 }
 
 #[derive(Debug)]
 enum Pokedex {
     Loading,
-    Loaded {
-        pokemon: Pokemon,
-        search: button::State,
-    },
-    Errored {
-        error: Error,
-        try_again: button::State,
-    },
+    Loaded { pokemon: Pokemon },
+    Errored,
 }
 
 #[derive(Debug, Clone)]
@@ -26,83 +21,71 @@ enum Message {
     Search,
 }
 
-impl Application for Pokedex {
-    type Executor = iced::executor::Default;
-    type Message = Message;
-    type Flags = ();
+impl Pokedex {
+    fn new() -> (Self, Task<Message>) {
+        (Self::Loading, Self::search())
+    }
 
-    fn new(_flags: ()) -> (Pokedex, Command<Message>) {
-        (
-            Pokedex::Loading,
-            Command::perform(Pokemon::search(), Message::PokemonFound),
-        )
+    fn search() -> Task<Message> {
+        Task::perform(Pokemon::search(), Message::PokemonFound)
     }
 
     fn title(&self) -> String {
         let subtitle = match self {
             Pokedex::Loading => "Loading",
             Pokedex::Loaded { pokemon, .. } => &pokemon.name,
-            Pokedex::Errored { .. } => "Whoops!",
+            Pokedex::Errored => "Whoops!",
         };
 
-        format!("{} - Pokédex", subtitle)
+        format!("{subtitle} - Pokédex")
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PokemonFound(Ok(pokemon)) => {
-                *self = Pokedex::Loaded {
-                    pokemon,
-                    search: button::State::new(),
-                };
+                *self = Pokedex::Loaded { pokemon };
 
-                Command::none()
+                Task::none()
             }
-            Message::PokemonFound(Err(error)) => {
-                *self = Pokedex::Errored {
-                    error,
-                    try_again: button::State::new(),
-                };
+            Message::PokemonFound(Err(_error)) => {
+                *self = Pokedex::Errored;
 
-                Command::none()
+                Task::none()
             }
             Message::Search => match self {
-                Pokedex::Loading => Command::none(),
+                Pokedex::Loading => Task::none(),
                 _ => {
                     *self = Pokedex::Loading;
 
-                    Command::perform(Pokemon::search(), Message::PokemonFound)
+                    Self::search()
                 }
             },
         }
     }
 
-    fn view(&mut self) -> Element<Message> {
-        let content = match self {
-            Pokedex::Loading => Column::new()
-                .width(Length::Shrink)
-                .push(Text::new("Searching for Pokémon...").size(40)),
-            Pokedex::Loaded { pokemon, search } => Column::new()
-                .max_width(500)
-                .spacing(20)
-                .align_items(Align::End)
-                .push(pokemon.view())
-                .push(
-                    button(search, "Keep searching!").on_press(Message::Search),
-                ),
-            Pokedex::Errored { try_again, .. } => Column::new()
-                .spacing(20)
-                .align_items(Align::End)
-                .push(Text::new("Whoops! Something went wrong...").size(40))
-                .push(button(try_again, "Try again").on_press(Message::Search)),
+    fn view(&self) -> Element<Message> {
+        let content: Element<_> = match self {
+            Pokedex::Loading => {
+                text("Searching for Pokémon...").size(40).into()
+            }
+            Pokedex::Loaded { pokemon } => column![
+                pokemon.view(),
+                button("Keep searching!").on_press(Message::Search)
+            ]
+            .max_width(500)
+            .spacing(20)
+            .align_x(Right)
+            .into(),
+            Pokedex::Errored => column![
+                text("Whoops! Something went wrong...").size(40),
+                button("Try again").on_press(Message::Search)
+            ]
+            .spacing(20)
+            .align_x(Right)
+            .into(),
         };
 
-        Container::new(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
+        center(content).into()
     }
 }
 
@@ -118,31 +101,22 @@ impl Pokemon {
     const TOTAL: u16 = 807;
 
     fn view(&self) -> Element<Message> {
-        Row::new()
-            .spacing(20)
-            .align_items(Align::Center)
-            .push(Image::new(self.image.clone()))
-            .push(
-                Column::new()
-                    .spacing(20)
-                    .push(
-                        Row::new()
-                            .align_items(Align::Center)
-                            .spacing(20)
-                            .push(
-                                Text::new(&self.name)
-                                    .size(30)
-                                    .width(Length::Fill),
-                            )
-                            .push(
-                                Text::new(format!("#{}", self.number))
-                                    .size(20)
-                                    .color([0.5, 0.5, 0.5]),
-                            ),
-                    )
-                    .push(Text::new(&self.description)),
-            )
-            .into()
+        row![
+            image::viewer(self.image.clone()),
+            column![
+                row![
+                    text(&self.name).size(30).width(Fill),
+                    text!("#{}", self.number).size(20).color([0.5, 0.5, 0.5]),
+                ]
+                .align_y(Center)
+                .spacing(20),
+                self.description.as_ref(),
+            ]
+            .spacing(20),
+        ]
+        .spacing(20)
+        .align_y(Center)
+        .into()
     }
 
     async fn search() -> Result<Pokemon, Error> {
@@ -151,7 +125,6 @@ impl Pokemon {
 
         #[derive(Debug, Deserialize)]
         struct Entry {
-            id: u32,
             name: String,
             flavor_text_entries: Vec<FlavorText>,
         }
@@ -168,14 +141,13 @@ impl Pokemon {
         }
 
         let id = {
-            let mut rng = rand::rngs::OsRng::default();
+            let mut rng = rand::rngs::OsRng;
 
-            rng.gen_range(0, Pokemon::TOTAL)
+            rng.gen_range(0..Pokemon::TOTAL)
         };
 
         let fetch_entry = async {
-            let url =
-                format!("https://pokeapi.co/api/v2/pokemon-species/{}", id);
+            let url = format!("https://pokeapi.co/api/v2/pokemon-species/{id}");
 
             reqwest::get(&url).await?.json().await
         };
@@ -187,8 +159,7 @@ impl Pokemon {
         let description = entry
             .flavor_text_entries
             .iter()
-            .filter(|text| text.language.name == "en")
-            .next()
+            .find(|text| text.language.name == "en")
             .ok_or(Error::LanguageError)?;
 
         Ok(Pokemon {
@@ -204,13 +175,15 @@ impl Pokemon {
     }
 
     async fn fetch_image(id: u16) -> Result<image::Handle, reqwest::Error> {
-        let url = format!("https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{}.png", id);
+        let url = format!(
+            "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{id}.png"
+        );
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             let bytes = reqwest::get(&url).await?.bytes().await?;
 
-            Ok(image::Handle::from_memory(bytes.as_ref().to_vec()))
+            Ok(image::Handle::from_bytes(bytes))
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -232,30 +205,6 @@ impl From<reqwest::Error> for Error {
     }
 }
 
-fn button<'a>(state: &'a mut button::State, text: &str) -> Button<'a, Message> {
-    Button::new(state, Text::new(text))
-        .padding(10)
-        .style(style::Button::Primary)
-}
-
-mod style {
-    use iced::{button, Background, Color, Vector};
-
-    pub enum Button {
-        Primary,
-    }
-
-    impl button::StyleSheet for Button {
-        fn active(&self) -> button::Style {
-            button::Style {
-                background: Some(Background::Color(match self {
-                    Button::Primary => Color::from_rgb(0.11, 0.42, 0.87),
-                })),
-                border_radius: 12,
-                shadow_offset: Vector::new(1.0, 1.0),
-                text_color: Color::WHITE,
-                ..button::Style::default()
-            }
-        }
-    }
+fn button(text: &str) -> widget::Button<'_, Message> {
+    widget::button(text).padding(10)
 }

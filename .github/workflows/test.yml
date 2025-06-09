@@ -1,33 +1,27 @@
 name: Test
 on: [push, pull_request]
 jobs:
-  native:
+  all:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: --deny warnings
+      ICED_TEST_BACKEND: tiny-skia
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        rust: [stable, beta]
+        rust: [stable, beta, "1.85"]
     steps:
-    - uses: hecrj/setup-rust-action@v1
+    - uses: hecrj/setup-rust-action@v2
       with:
         rust-version: ${{ matrix.rust }}
     - uses: actions/checkout@master
+    - name: Install dependencies
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        export DEBIAN_FRONTED=noninteractive
+        sudo apt-get -qq update
+        sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
     - name: Run tests
       run: |
-        cargo test --verbose --all
-        cargo test --verbose --all --all-features
-
-  web:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: hecrj/setup-rust-action@v1
-      with:
-        rust-version: stable
-        targets: wasm32-unknown-unknown
-    - uses: actions/checkout@master
-    - name: Run checks
-      run: cargo check --package iced --target wasm32-unknown-unknown
-    - name: Check compilation of `tour` example
-      run: cargo build --package tour --target wasm32-unknown-unknown
-    - name: Check compilation of `pokedex` example
-      run: cargo build --package pokedex --target wasm32-unknown-unknown
+        cargo test --verbose --workspace -- --ignored
+        cargo test --verbose --workspace --all-features -- --ignored

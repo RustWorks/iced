@@ -1,43 +1,39 @@
 //! Run commands and keep track of subscriptions.
-use crate::{subscription, Command, Executor, Subscription};
+use crate::subscription;
+use crate::{BoxStream, Executor, MaybeSend};
 
-use futures::{channel::mpsc, Sink};
+use futures::{Sink, channel::mpsc};
 use std::marker::PhantomData;
 
 /// A batteries-included runtime of commands and subscriptions.
 ///
 /// If you have an [`Executor`], a [`Runtime`] can be leveraged to run any
-/// [`Command`] or [`Subscription`] and get notified of the results!
+/// `Command` or [`Subscription`] and get notified of the results!
 ///
-/// [`Runtime`]: struct.Runtime.html
-/// [`Executor`]: executor/trait.Executor.html
-/// [`Command`]: struct.Command.html
-/// [`Subscription`]: subscription/struct.Subscription.html
+/// [`Subscription`]: crate::Subscription
 #[derive(Debug)]
-pub struct Runtime<Hasher, Event, Executor, Sender, Message> {
+pub struct Runtime<Executor, Sender, Message> {
     executor: Executor,
     sender: Sender,
-    subscriptions: subscription::Tracker<Hasher, Event>,
+    subscriptions: subscription::Tracker,
     _message: PhantomData<Message>,
 }
 
-impl<Hasher, Event, Executor, Sender, Message>
-    Runtime<Hasher, Event, Executor, Sender, Message>
+impl<Executor, Sender, Message> Runtime<Executor, Sender, Message>
 where
-    Hasher: std::hash::Hasher + Default,
-    Event: Send + Clone + 'static,
     Executor: self::Executor,
-    Sender:
-        Sink<Message, Error = mpsc::SendError> + Unpin + Send + Clone + 'static,
-    Message: Send + 'static,
+    Sender: Sink<Message, Error = mpsc::SendError>
+        + Unpin
+        + MaybeSend
+        + Clone
+        + 'static,
+    Message: MaybeSend + 'static,
 {
     /// Creates a new empty [`Runtime`].
     ///
     /// You need to provide:
     /// - an [`Executor`] to spawn futures
     /// - a `Sender` implementing `Sink` to receive the results
-    ///
-    /// [`Runtime`]: struct.Runtime.html
     pub fn new(executor: Executor, sender: Sender) -> Self {
         Self {
             executor,
@@ -50,37 +46,37 @@ where
     /// Runs the given closure inside the [`Executor`] of the [`Runtime`].
     ///
     /// See [`Executor::enter`] to learn more.
-    ///
-    /// [`Executor`]: executor/trait.Executor.html
-    /// [`Runtime`]: struct.Runtime.html
-    /// [`Executor::enter`]: executor/trait.Executor.html#method.enter
     pub fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
         self.executor.enter(f)
     }
 
-    /// Spawns a [`Command`] in the [`Runtime`].
+    /// Runs a future to completion in the current thread within the [`Runtime`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn block_on<T>(&mut self, future: impl Future<Output = T>) -> T {
+        self.executor.block_on(future)
+    }
+
+    /// Runs a [`Stream`] in the [`Runtime`] until completion.
     ///
-    /// The resulting `Message` will be forwarded to the `Sender` of the
+    /// The resulting `Message`s will be forwarded to the `Sender` of the
     /// [`Runtime`].
     ///
-    /// [`Command`]: struct.Command.html
-    /// [`Runtime`]: struct.Runtime.html
-    pub fn spawn(&mut self, command: Command<Message>) {
-        use futures::{FutureExt, SinkExt};
+    /// [`Stream`]: BoxStream
+    pub fn run(&mut self, stream: BoxStream<Message>) {
+        use futures::{FutureExt, StreamExt};
 
-        let futures = command.futures();
-
-        for future in futures {
-            let mut sender = self.sender.clone();
-
-            let future = future.then(|message| async move {
-                let _ = sender.send(message).await;
-
-                ()
+        let sender = self.sender.clone();
+        let future =
+            stream.map(Ok).forward(sender).map(|result| match result {
+                Ok(()) => (),
+                Err(error) => {
+                    log::warn!(
+                        "Stream could not run until completion: {error}"
+                    );
+                }
             });
 
-            self.executor.spawn(future);
-        }
+        self.executor.spawn(future);
     }
 
     /// Tracks a [`Subscription`] in the [`Runtime`].
@@ -88,12 +84,13 @@ where
     /// It will spawn new streams or close old ones as necessary! See
     /// [`Tracker::update`] to learn more about this!
     ///
-    /// [`Subscription`]: subscription/struct.Subscription.html
-    /// [`Runtime`]: struct.Runtime.html
-    /// [`Tracker::update`]: subscription/struct.Tracker.html#method.update
+    /// [`Tracker::update`]: subscription::Tracker::update
+    /// [`Subscription`]: crate::Subscription
     pub fn track(
         &mut self,
-        subscription: Subscription<Hasher, Event, Message>,
+        recipes: impl IntoIterator<
+            Item = Box<dyn subscription::Recipe<Output = Message>>,
+        >,
     ) {
         let Runtime {
             executor,
@@ -102,8 +99,9 @@ where
             ..
         } = self;
 
-        let futures = executor
-            .enter(|| subscriptions.update(subscription, sender.clone()));
+        let futures = executor.enter(|| {
+            subscriptions.update(recipes.into_iter(), sender.clone())
+        });
 
         for future in futures {
             executor.spawn(future);
@@ -115,10 +113,8 @@ where
     ///
     /// See [`Tracker::broadcast`] to learn more.
     ///
-    /// [`Runtime`]: struct.Runtime.html
-    /// [`Tracker::broadcast`]:
-    /// subscription/struct.Tracker.html#method.broadcast
-    pub fn broadcast(&mut self, event: Event) {
+    /// [`Tracker::broadcast`]: subscription::Tracker::broadcast
+    pub fn broadcast(&mut self, event: subscription::Event) {
         self.subscriptions.broadcast(event);
     }
 }

@@ -1,86 +1,73 @@
+use crate::core::Size;
+use crate::core::image;
+use crate::graphics;
+use crate::graphics::image::image_rs;
 use crate::image::atlas::{self, Atlas};
-use iced_native::image;
-use std::collections::{HashMap, HashSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Entry in cache corresponding to an image handle
 #[derive(Debug)]
 pub enum Memory {
-    Host(::image::ImageBuffer<::image::Bgra<u8>, Vec<u8>>),
+    /// Image data on host
+    Host(image_rs::ImageBuffer<image_rs::Rgba<u8>, image::Bytes>),
+    /// Storage entry
     Device(atlas::Entry),
+    /// Image not found
     NotFound,
+    /// Invalid image data
     Invalid,
 }
 
 impl Memory {
-    pub fn dimensions(&self) -> (u32, u32) {
+    /// Width and height of image
+    pub fn dimensions(&self) -> Size<u32> {
         match self {
-            Memory::Host(image) => image.dimensions(),
+            Memory::Host(image) => {
+                let (width, height) = image.dimensions();
+
+                Size::new(width, height)
+            }
             Memory::Device(entry) => entry.size(),
-            Memory::NotFound => (1, 1),
-            Memory::Invalid => (1, 1),
+            Memory::NotFound => Size::new(1, 1),
+            Memory::Invalid => Size::new(1, 1),
         }
     }
 }
 
-#[derive(Debug)]
+/// Caches image raster data
+#[derive(Debug, Default)]
 pub struct Cache {
-    map: HashMap<u64, Memory>,
-    hits: HashSet<u64>,
+    map: FxHashMap<image::Id, Memory>,
+    hits: FxHashSet<image::Id>,
+    should_trim: bool,
 }
 
 impl Cache {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            hits: HashSet::new(),
-        }
-    }
-
+    /// Load image
     pub fn load(&mut self, handle: &image::Handle) -> &mut Memory {
         if self.contains(handle) {
             return self.get(handle).unwrap();
         }
 
-        let memory = match handle.data() {
-            image::Data::Path(path) => {
-                if let Ok(image) = ::image::open(path) {
-                    Memory::Host(image.to_bgra())
-                } else {
-                    Memory::NotFound
-                }
-            }
-            image::Data::Bytes(bytes) => {
-                if let Ok(image) = ::image::load_from_memory(&bytes) {
-                    Memory::Host(image.to_bgra())
-                } else {
-                    Memory::Invalid
-                }
-            }
-            image::Data::Pixels {
-                width,
-                height,
-                pixels,
-            } => {
-                if let Some(image) = ::image::ImageBuffer::from_vec(
-                    *width,
-                    *height,
-                    pixels.to_vec(),
-                ) {
-                    Memory::Host(image)
-                } else {
-                    Memory::Invalid
-                }
-            }
+        let memory = match graphics::image::load(handle) {
+            Ok(image) => Memory::Host(image),
+            Err(image_rs::error::ImageError::IoError(_)) => Memory::NotFound,
+            Err(_) => Memory::Invalid,
         };
+
+        self.should_trim = true;
 
         self.insert(handle, memory);
         self.get(handle).unwrap()
     }
 
+    /// Load image and upload raster data
     pub fn upload(
         &mut self,
-        handle: &image::Handle,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        handle: &image::Handle,
         atlas: &mut Atlas,
     ) -> Option<&atlas::Entry> {
         let memory = self.load(handle);
@@ -88,7 +75,7 @@ impl Cache {
         if let Memory::Host(image) = memory {
             let (width, height) = image.dimensions();
 
-            let entry = atlas.upload(width, height, &image, device, encoder)?;
+            let entry = atlas.upload(device, encoder, width, height, image)?;
 
             *memory = Memory::Device(entry);
         }
@@ -100,7 +87,13 @@ impl Cache {
         }
     }
 
+    /// Trim cache misses from cache
     pub fn trim(&mut self, atlas: &mut Atlas) {
+        // Only trim if new entries have landed in the `Cache`
+        if !self.should_trim {
+            return;
+        }
+
         let hits = &self.hits;
 
         self.map.retain(|k, memory| {
@@ -116,6 +109,7 @@ impl Cache {
         });
 
         self.hits.clear();
+        self.should_trim = false;
     }
 
     fn get(&mut self, handle: &image::Handle) -> Option<&mut Memory> {

@@ -1,301 +1,338 @@
-use crate::Transformation;
-use iced_graphics::layer;
-use iced_native::Rectangle;
+mod gradient;
+mod solid;
+
+use gradient::Gradient;
+use solid::Solid;
+
+use crate::core::{Background, Rectangle, Transformation};
+use crate::graphics;
+use crate::graphics::color;
+
+use bytemuck::{Pod, Zeroable};
 
 use std::mem;
-use zerocopy::AsBytes;
 
-#[derive(Debug)]
+const INITIAL_INSTANCES: usize = 2_000;
+
+/// The properties of a quad.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Quad {
+    /// The position of the [`Quad`].
+    pub position: [f32; 2],
+
+    /// The size of the [`Quad`].
+    pub size: [f32; 2],
+
+    /// The border color of the [`Quad`], in __linear RGB__.
+    pub border_color: color::Packed,
+
+    /// The border radii of the [`Quad`].
+    pub border_radius: [f32; 4],
+
+    /// The border width of the [`Quad`].
+    pub border_width: f32,
+
+    /// The shadow color of the [`Quad`].
+    pub shadow_color: color::Packed,
+
+    /// The shadow offset of the [`Quad`].
+    pub shadow_offset: [f32; 2],
+
+    /// The shadow blur radius of the [`Quad`].
+    pub shadow_blur_radius: f32,
+
+    /// Whether the [`Quad`] should be snapped to the pixel grid.
+    pub snap: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct Pipeline {
-    pipeline: wgpu::RenderPipeline,
-    constants: wgpu::BindGroup,
-    constants_buffer: wgpu::Buffer,
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    instances: wgpu::Buffer,
+    solid: solid::Pipeline,
+    gradient: gradient::Pipeline,
+    constant_layout: wgpu::BindGroupLayout,
+}
+
+#[derive(Default)]
+pub struct State {
+    layers: Vec<Layer>,
+    prepare_layer: usize,
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn prepare(
+        &mut self,
+        pipeline: &Pipeline,
+        device: &wgpu::Device,
+        belt: &mut wgpu::util::StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        quads: &Batch,
+        transformation: Transformation,
+        scale: f32,
+    ) {
+        if self.layers.len() <= self.prepare_layer {
+            self.layers
+                .push(Layer::new(device, &pipeline.constant_layout));
+        }
+
+        let layer = &mut self.layers[self.prepare_layer];
+        layer.prepare(device, encoder, belt, quads, transformation, scale);
+
+        self.prepare_layer += 1;
+    }
+
+    pub fn render<'a>(
+        &'a self,
+        pipeline: &'a Pipeline,
+        layer: usize,
+        bounds: Rectangle<u32>,
+        quads: &Batch,
+        render_pass: &mut wgpu::RenderPass<'a>,
+    ) {
+        if let Some(layer) = self.layers.get(layer) {
+            render_pass.set_scissor_rect(
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+            );
+
+            let mut solid_offset = 0;
+            let mut gradient_offset = 0;
+
+            for (kind, count) in &quads.order {
+                match kind {
+                    Kind::Solid => {
+                        pipeline.solid.render(
+                            render_pass,
+                            &layer.constants,
+                            &layer.solid,
+                            solid_offset..(solid_offset + count),
+                        );
+
+                        solid_offset += count;
+                    }
+                    Kind::Gradient => {
+                        pipeline.gradient.render(
+                            render_pass,
+                            &layer.constants,
+                            &layer.gradient,
+                            gradient_offset..(gradient_offset + count),
+                        );
+
+                        gradient_offset += count;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn trim(&mut self) {
+        self.prepare_layer = 0;
+    }
 }
 
 impl Pipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Pipeline {
         let constant_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                bindings: &[wgpu::BindGroupLayoutEntry {
+                label: Some("iced_wgpu::quad uniforms layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStage::VERTEX,
-                    ty: wgpu::BindingType::UniformBuffer { dynamic: false },
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            mem::size_of::<Uniforms>() as wgpu::BufferAddress,
+                        ),
+                    },
+                    count: None,
                 }],
             });
 
-        let constants_buffer = device.create_buffer_with_data(
-            Uniforms::default().as_bytes(),
-            wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        );
+        Self {
+            solid: solid::Pipeline::new(device, format, &constant_layout),
+            gradient: gradient::Pipeline::new(device, format, &constant_layout),
+            constant_layout,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Layer {
+    constants: wgpu::BindGroup,
+    constants_buffer: wgpu::Buffer,
+    solid: solid::Layer,
+    gradient: gradient::Layer,
+}
+
+impl Layer {
+    pub fn new(
+        device: &wgpu::Device,
+        constant_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let constants_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iced_wgpu::quad uniforms buffer"),
+            size: mem::size_of::<Uniforms>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let constants = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &constant_layout,
-            bindings: &[wgpu::Binding {
+            label: Some("iced_wgpu::quad uniforms bind group"),
+            layout: constant_layout,
+            entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer {
-                    buffer: &constants_buffer,
-                    range: 0..std::mem::size_of::<Uniforms>() as u64,
-                },
+                resource: constants_buffer.as_entire_binding(),
             }],
         });
 
-        let layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                bind_group_layouts: &[&constant_layout],
-            });
-
-        let vs = include_bytes!("shader/quad.vert.spv");
-        let vs_module = device.create_shader_module(
-            &wgpu::read_spirv(std::io::Cursor::new(&vs[..]))
-                .expect("Read quad vertex shader as SPIR-V"),
-        );
-
-        let fs = include_bytes!("shader/quad.frag.spv");
-        let fs_module = device.create_shader_module(
-            &wgpu::read_spirv(std::io::Cursor::new(&fs[..]))
-                .expect("Read quad fragment shader as SPIR-V"),
-        );
-
-        let pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                layout: &layout,
-                vertex_stage: wgpu::ProgrammableStageDescriptor {
-                    module: &vs_module,
-                    entry_point: "main",
-                },
-                fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                    module: &fs_module,
-                    entry_point: "main",
-                }),
-                rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-                    front_face: wgpu::FrontFace::Cw,
-                    cull_mode: wgpu::CullMode::None,
-                    depth_bias: 0,
-                    depth_bias_slope_scale: 0.0,
-                    depth_bias_clamp: 0.0,
-                }),
-                primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-                color_states: &[wgpu::ColorStateDescriptor {
-                    format,
-                    color_blend: wgpu::BlendDescriptor {
-                        src_factor: wgpu::BlendFactor::SrcAlpha,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha_blend: wgpu::BlendDescriptor {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    write_mask: wgpu::ColorWrite::ALL,
-                }],
-                depth_stencil_state: None,
-                vertex_state: wgpu::VertexStateDescriptor {
-                    index_format: wgpu::IndexFormat::Uint16,
-                    vertex_buffers: &[
-                        wgpu::VertexBufferDescriptor {
-                            stride: mem::size_of::<Vertex>() as u64,
-                            step_mode: wgpu::InputStepMode::Vertex,
-                            attributes: &[wgpu::VertexAttributeDescriptor {
-                                shader_location: 0,
-                                format: wgpu::VertexFormat::Float2,
-                                offset: 0,
-                            }],
-                        },
-                        wgpu::VertexBufferDescriptor {
-                            stride: mem::size_of::<layer::Quad>() as u64,
-                            step_mode: wgpu::InputStepMode::Instance,
-                            attributes: &[
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 1,
-                                    format: wgpu::VertexFormat::Float2,
-                                    offset: 0,
-                                },
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 2,
-                                    format: wgpu::VertexFormat::Float2,
-                                    offset: 4 * 2,
-                                },
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 3,
-                                    format: wgpu::VertexFormat::Float4,
-                                    offset: 4 * (2 + 2),
-                                },
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 4,
-                                    format: wgpu::VertexFormat::Float4,
-                                    offset: 4 * (2 + 2 + 4),
-                                },
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 5,
-                                    format: wgpu::VertexFormat::Float,
-                                    offset: 4 * (2 + 2 + 4 + 4),
-                                },
-                                wgpu::VertexAttributeDescriptor {
-                                    shader_location: 6,
-                                    format: wgpu::VertexFormat::Float,
-                                    offset: 4 * (2 + 2 + 4 + 4 + 1),
-                                },
-                            ],
-                        },
-                    ],
-                },
-                sample_count: 1,
-                sample_mask: !0,
-                alpha_to_coverage_enabled: false,
-            });
-
-        let vertices = device.create_buffer_with_data(
-            QUAD_VERTS.as_bytes(),
-            wgpu::BufferUsage::VERTEX,
-        );
-
-        let indices = device.create_buffer_with_data(
-            QUAD_INDICES.as_bytes(),
-            wgpu::BufferUsage::INDEX,
-        );
-
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: mem::size_of::<layer::Quad>() as u64 * MAX_INSTANCES as u64,
-            usage: wgpu::BufferUsage::VERTEX | wgpu::BufferUsage::COPY_DST,
-        });
-
-        Pipeline {
-            pipeline,
+        Self {
             constants,
             constants_buffer,
-            vertices,
-            indices,
-            instances,
+            solid: solid::Layer::new(device),
+            gradient: gradient::Layer::new(device),
         }
     }
 
-    pub fn draw(
+    pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        instances: &[layer::Quad],
+        belt: &mut wgpu::util::StagingBelt,
+        quads: &Batch,
         transformation: Transformation,
         scale: f32,
-        bounds: Rectangle<u32>,
-        target: &wgpu::TextureView,
+    ) {
+        self.update(device, encoder, belt, transformation, scale);
+
+        if !quads.solids.is_empty() {
+            self.solid.prepare(device, encoder, belt, &quads.solids);
+        }
+
+        if !quads.gradients.is_empty() {
+            self.gradient
+                .prepare(device, encoder, belt, &quads.gradients);
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        belt: &mut wgpu::util::StagingBelt,
+        transformation: Transformation,
+        scale: f32,
     ) {
         let uniforms = Uniforms::new(transformation, scale);
+        let bytes = bytemuck::bytes_of(&uniforms);
 
-        let constants_buffer = device.create_buffer_with_data(
-            uniforms.as_bytes(),
-            wgpu::BufferUsage::COPY_SRC,
-        );
-
-        encoder.copy_buffer_to_buffer(
-            &constants_buffer,
-            0,
+        belt.write_buffer(
+            encoder,
             &self.constants_buffer,
             0,
-            std::mem::size_of::<Uniforms>() as u64,
-        );
-
-        let mut i = 0;
-        let total = instances.len();
-
-        while i < total {
-            let end = (i + MAX_INSTANCES).min(total);
-            let amount = end - i;
-
-            let instance_buffer = device.create_buffer_with_data(
-                bytemuck::cast_slice(&instances[i..end]),
-                wgpu::BufferUsage::COPY_SRC,
-            );
-
-            encoder.copy_buffer_to_buffer(
-                &instance_buffer,
-                0,
-                &self.instances,
-                0,
-                (mem::size_of::<layer::Quad>() * amount) as u64,
-            );
-
-            {
-                let mut render_pass =
-                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[
-                            wgpu::RenderPassColorAttachmentDescriptor {
-                                attachment: target,
-                                resolve_target: None,
-                                load_op: wgpu::LoadOp::Load,
-                                store_op: wgpu::StoreOp::Store,
-                                clear_color: wgpu::Color {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
-                                    a: 0.0,
-                                },
-                            },
-                        ],
-                        depth_stencil_attachment: None,
-                    });
-
-                render_pass.set_pipeline(&self.pipeline);
-                render_pass.set_bind_group(0, &self.constants, &[]);
-                render_pass.set_index_buffer(&self.indices, 0, 0);
-                render_pass.set_vertex_buffer(0, &self.vertices, 0, 0);
-                render_pass.set_vertex_buffer(1, &self.instances, 0, 0);
-                render_pass.set_scissor_rect(
-                    bounds.x,
-                    bounds.y,
-                    bounds.width,
-                    // TODO: Address anti-aliasing adjustments properly
-                    bounds.height + 1,
-                );
-
-                render_pass.draw_indexed(
-                    0..QUAD_INDICES.len() as u32,
-                    0,
-                    0..amount as u32,
-                );
-            }
-
-            i += MAX_INSTANCES;
-        }
+            (bytes.len() as u64).try_into().expect("Sized uniforms"),
+            device,
+        )
+        .copy_from_slice(bytes);
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, AsBytes)]
-pub struct Vertex {
-    _position: [f32; 2],
+/// A group of [`Quad`]s rendered together.
+#[derive(Default, Debug)]
+pub struct Batch {
+    /// The solid quads of the [`Layer`].
+    solids: Vec<Solid>,
+
+    /// The gradient quads of the [`Layer`].
+    gradients: Vec<Gradient>,
+
+    /// The quad order of the [`Layer`].
+    order: Order,
 }
 
-const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
+/// The quad order of a [`Layer`]; stored as a tuple of the quad type & its count.
+type Order = Vec<(Kind, usize)>;
 
-const QUAD_VERTS: [Vertex; 4] = [
-    Vertex {
-        _position: [0.0, 0.0],
-    },
-    Vertex {
-        _position: [1.0, 0.0],
-    },
-    Vertex {
-        _position: [1.0, 1.0],
-    },
-    Vertex {
-        _position: [0.0, 1.0],
-    },
-];
+impl Batch {
+    /// Returns true if there are no quads of any type in [`Quads`].
+    pub fn is_empty(&self) -> bool {
+        self.solids.is_empty() && self.gradients.is_empty()
+    }
 
-const MAX_INSTANCES: usize = 100_000;
+    /// Adds a [`Quad`] with the provided `Background` type to the quad [`Layer`].
+    pub fn add(&mut self, quad: Quad, background: &Background) {
+        let kind = match background {
+            Background::Color(color) => {
+                self.solids.push(Solid {
+                    color: color::pack(*color),
+                    quad,
+                });
+
+                Kind::Solid
+            }
+            Background::Gradient(gradient) => {
+                self.gradients.push(Gradient {
+                    gradient: graphics::gradient::pack(
+                        gradient,
+                        Rectangle::new(quad.position.into(), quad.size.into()),
+                    ),
+                    quad,
+                });
+
+                Kind::Gradient
+            }
+        };
+
+        match self.order.last_mut() {
+            Some((last_kind, count)) if kind == *last_kind => {
+                *count += 1;
+            }
+            _ => {
+                self.order.push((kind, 1));
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.solids.clear();
+        self.gradients.clear();
+        self.order.clear();
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// The kind of a quad.
+enum Kind {
+    /// A solid quad
+    Solid,
+    /// A gradient quad
+    Gradient,
+}
+
+fn color_target_state(
+    format: wgpu::TextureFormat,
+) -> [Option<wgpu::ColorTargetState>; 1] {
+    [Some(wgpu::ColorTargetState {
+        format,
+        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    })]
+}
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AsBytes)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct Uniforms {
     transform: [f32; 16],
     scale: f32,
+    // Uniforms must be aligned to their largest member,
+    // this uses a mat4x4<f32> which aligns to 16, so align to that
+    _padding: [f32; 3],
 }
 
 impl Uniforms {
@@ -303,6 +340,7 @@ impl Uniforms {
         Self {
             transform: *transformation.as_ref(),
             scale,
+            _padding: [0.0; 3],
         }
     }
 }
@@ -310,8 +348,9 @@ impl Uniforms {
 impl Default for Uniforms {
     fn default() -> Self {
         Self {
-            transform: *Transformation::identity().as_ref(),
+            transform: *Transformation::IDENTITY.as_ref(),
             scale: 1.0,
+            _padding: [0.0; 3],
         }
     }
 }

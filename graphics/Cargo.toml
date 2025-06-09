@@ -1,37 +1,48 @@
 [package]
 name = "iced_graphics"
-version = "0.1.0"
-authors = ["Héctor Ramón Jiménez <hector0193@gmail.com>"]
-edition = "2018"
+description = "A bunch of backend-agnostic types that can be leveraged to build a renderer for iced"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
-[features]
-canvas = ["lyon"]
-font-source = ["font-kit"]
-font-fallback = []
-font-icons = []
-opengl = []
-
-[dependencies]
-bytemuck = "1.2"
-glam = "0.9"
-raw-window-handle = "0.3"
-
-[dependencies.iced_native]
-version = "0.2"
-path = "../native"
-
-[dependencies.iced_style]
-version = "0.1"
-path = "../style"
-
-[dependencies.lyon]
-version = "0.15"
-optional = true
-
-[dependencies.font-kit]
-version = "0.6"
-optional = true
+[lints]
+workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 all-features = true
+
+[features]
+geometry = ["lyon_path"]
+image = ["dep:image", "kamadak-exif"]
+svg = []
+web-colors = []
+fira-sans = []
+
+[dependencies]
+iced_core.workspace = true
+iced_futures.workspace = true
+
+bitflags.workspace = true
+bytemuck.workspace = true
+cosmic-text.workspace = true
+half.workspace = true
+log.workspace = true
+raw-window-handle.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+unicode-segmentation.workspace = true
+
+image.workspace = true
+image.optional = true
+
+kamadak-exif.workspace = true
+kamadak-exif.optional = true
+
+lyon_path.workspace = true
+lyon_path.optional = true

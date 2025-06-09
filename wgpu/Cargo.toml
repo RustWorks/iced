@@ -1,48 +1,47 @@
 [package]
 name = "iced_wgpu"
-version = "0.2.2"
-authors = ["Héctor Ramón Jiménez <hector0193@gmail.com>"]
-edition = "2018"
-description = "A wgpu renderer for Iced"
-license = "MIT AND OFL-1.1"
-repository = "https://github.com/hecrj/iced"
+description = "A renderer for iced on top of wgpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
-[features]
-svg = ["resvg"]
-canvas = ["iced_graphics/canvas"]
-default_system_font = ["iced_graphics/font-source"]
-
-[dependencies]
-wgpu = "0.5"
-wgpu_glyph = "0.9"
-glyph_brush = "0.7"
-zerocopy = "0.3"
-bytemuck = "1.2"
-raw-window-handle = "0.3"
-log = "0.4"
-guillotiere = "0.5"
-# Pin `gfx-memory` until https://github.com/gfx-rs/wgpu-rs/issues/261 is
-# resolved
-gfx-memory = "=0.1.1"
-
-[dependencies.iced_native]
-version = "0.2"
-path = "../native"
-
-[dependencies.iced_graphics]
-version = "0.1"
-path = "../graphics"
-features = ["font-fallback", "font-icons"]
-
-[dependencies.image]
-version = "0.23"
-optional = true
-
-[dependencies.resvg]
-version = "0.9"
-features = ["raqote-backend"]
-optional = true
+[lints]
+workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 all-features = true
+
+[features]
+geometry = ["iced_graphics/geometry", "lyon"]
+image = ["iced_graphics/image"]
+svg = ["iced_graphics/svg", "resvg/text"]
+web-colors = ["iced_graphics/web-colors"]
+webgl = ["wgpu/webgl"]
+strict-assertions = []
+
+[dependencies]
+iced_debug.workspace = true
+iced_graphics.workspace = true
+
+bitflags.workspace = true
+bytemuck.workspace = true
+futures.workspace = true
+glam.workspace = true
+cryoglyph.workspace = true
+guillotiere.workspace = true
+log.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+
+lyon.workspace = true
+lyon.optional = true
+
+resvg.workspace = true
+resvg.optional = true

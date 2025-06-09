@@ -12,45 +12,85 @@ use allocator::Allocator;
 
 pub const SIZE: u32 = 2048;
 
+use crate::core::Size;
+use crate::graphics::color;
+
+use std::sync::Arc;
+
 #[derive(Debug)]
 pub struct Atlas {
+    backend: wgpu::Backend,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
+    texture_bind_group: wgpu::BindGroup,
+    texture_layout: Arc<wgpu::BindGroupLayout>,
     layers: Vec<Layer>,
 }
 
 impl Atlas {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        backend: wgpu::Backend,
+        texture_layout: Arc<wgpu::BindGroupLayout>,
+    ) -> Self {
+        let layers = match backend {
+            // On the GL backend we start with 2 layers, to help wgpu figure
+            // out that this texture is `GL_TEXTURE_2D_ARRAY` rather than `GL_TEXTURE_2D`
+            // https://github.com/gfx-rs/wgpu/blob/004e3efe84a320d9331371ed31fa50baa2414911/wgpu-hal/src/gles/mod.rs#L371
+            wgpu::Backend::Gl => vec![Layer::Empty, Layer::Empty],
+            _ => vec![Layer::Empty],
+        };
+
         let extent = wgpu::Extent3d {
             width: SIZE,
             height: SIZE,
-            depth: 1,
+            depth_or_array_layers: layers.len() as u32,
         };
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
+            label: Some("iced_wgpu::image texture atlas"),
             size: extent,
-            array_layer_count: 2,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            usage: wgpu::TextureUsage::COPY_DST
-                | wgpu::TextureUsage::COPY_SRC
-                | wgpu::TextureUsage::SAMPLED,
+            format: if color::GAMMA_CORRECTION {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
 
-        let texture_view = texture.create_default_view();
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        let texture_bind_group =
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iced_wgpu::image texture atlas bind group"),
+                layout: &texture_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                }],
+            });
 
         Atlas {
+            backend,
             texture,
             texture_view,
-            layers: vec![Layer::Empty, Layer::Empty],
+            texture_bind_group,
+            texture_layout,
+            layers,
         }
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.texture_view
+    pub fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.texture_bind_group
     }
 
     pub fn layer_count(&self) -> usize {
@@ -59,11 +99,11 @@ impl Atlas {
 
     pub fn upload(
         &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
         width: u32,
         height: u32,
         data: &[u8],
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
     ) -> Option<Entry> {
         let entry = {
             let current_size = self.layers.len();
@@ -76,46 +116,73 @@ impl Atlas {
             entry
         };
 
-        log::info!("Allocated atlas entry: {:?}", entry);
+        log::debug!("Allocated atlas entry: {entry:?}");
 
-        let buffer =
-            device.create_buffer_with_data(data, wgpu::BufferUsage::COPY_SRC);
+        // It is a webgpu requirement that:
+        //   BufferCopyView.layout.bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0
+        // So we calculate padded_width by rounding width up to the next
+        // multiple of wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padding = (align - (4 * width) % align) % align;
+        let padded_width = (4 * width + padding) as usize;
+        let padded_data_size = padded_width * height as usize;
+
+        let mut padded_data = vec![0; padded_data_size];
+
+        for row in 0..height as usize {
+            let offset = row * padded_width;
+
+            padded_data[offset..offset + 4 * width as usize].copy_from_slice(
+                &data[row * 4 * width as usize..(row + 1) * 4 * width as usize],
+            );
+        }
 
         match &entry {
             Entry::Contiguous(allocation) => {
                 self.upload_allocation(
-                    &buffer,
+                    &padded_data,
                     width,
                     height,
+                    padding,
                     0,
-                    &allocation,
+                    allocation,
+                    device,
                     encoder,
                 );
             }
             Entry::Fragmented { fragments, .. } => {
                 for fragment in fragments {
                     let (x, y) = fragment.position;
-                    let offset = (y * width + x) as usize * 4;
+                    let offset = (y * padded_width as u32 + 4 * x) as usize;
 
                     self.upload_allocation(
-                        &buffer,
+                        &padded_data,
                         width,
                         height,
+                        padding,
                         offset,
                         &fragment.allocation,
+                        device,
                         encoder,
                     );
                 }
             }
         }
 
-        log::info!("Current atlas: {:?}", self);
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "Atlas layers: {} (busy: {}, allocations: {})",
+                self.layer_count(),
+                self.layers.iter().filter(|layer| !layer.is_empty()).count(),
+                self.layers.iter().map(Layer::allocations).sum::<usize>(),
+            );
+        }
 
         Some(entry)
     }
 
     pub fn remove(&mut self, entry: &Entry) {
-        log::info!("Removing atlas entry: {:?}", entry);
+        log::debug!("Removing atlas entry: {entry:?}");
 
         match entry {
             Entry::Contiguous(allocation) => {
@@ -179,7 +246,7 @@ impl Atlas {
             }
 
             return Some(Entry::Fragmented {
-                size: (width, height),
+                size: Size::new(width, height),
                 fragments,
             });
         }
@@ -207,7 +274,7 @@ impl Atlas {
                         }));
                     }
                 }
-                _ => {}
+                Layer::Full => {}
             }
         }
 
@@ -228,7 +295,7 @@ impl Atlas {
     }
 
     fn deallocate(&mut self, allocation: &Allocation) {
-        log::info!("Deallocating atlas: {:?}", allocation);
+        log::debug!("Deallocating atlas: {allocation:?}");
 
         match allocation {
             Allocation::Full { layer } => {
@@ -250,35 +317,52 @@ impl Atlas {
 
     fn upload_allocation(
         &mut self,
-        buffer: &wgpu::Buffer,
+        data: &[u8],
         image_width: u32,
         image_height: u32,
+        padding: u32,
         offset: usize,
         allocation: &Allocation,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
     ) {
+        use wgpu::util::DeviceExt;
+
         let (x, y) = allocation.position();
-        let (width, height) = allocation.size();
+        let Size { width, height } = allocation.size();
         let layer = allocation.layer();
 
         let extent = wgpu::Extent3d {
             width,
             height,
-            depth: 1,
+            depth_or_array_layers: 1,
         };
 
+        let buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("image upload buffer"),
+                contents: data,
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
+
         encoder.copy_buffer_to_texture(
-            wgpu::BufferCopyView {
-                buffer,
-                offset: offset as u64,
-                bytes_per_row: 4 * image_width,
-                rows_per_image: image_height,
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: offset as u64,
+                    bytes_per_row: Some(4 * image_width + padding),
+                    rows_per_image: Some(image_height),
+                },
             },
-            wgpu::TextureCopyView {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
-                array_layer: layer as u32,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
+                origin: wgpu::Origin3d {
+                    x,
+                    y,
+                    z: layer as u32,
+                },
+                aspect: wgpu::TextureAspect::default(),
             },
             extent,
         );
@@ -294,21 +378,35 @@ impl Atlas {
             return;
         }
 
+        // On the GL backend if layers.len() == 6 we need to help wgpu figure out that this texture
+        // is still a `GL_TEXTURE_2D_ARRAY` rather than `GL_TEXTURE_CUBE_MAP`. This will over-allocate
+        // some unused memory on GL, but it's better than not being able to grow the atlas past a depth
+        // of 6!
+        // https://github.com/gfx-rs/wgpu/blob/004e3efe84a320d9331371ed31fa50baa2414911/wgpu-hal/src/gles/mod.rs#L371
+        let depth_or_array_layers = match self.backend {
+            wgpu::Backend::Gl if self.layers.len() == 6 => 7,
+            _ => self.layers.len() as u32,
+        };
+
         let new_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
+            label: Some("iced_wgpu::image texture atlas"),
             size: wgpu::Extent3d {
                 width: SIZE,
                 height: SIZE,
-                depth: 1,
+                depth_or_array_layers,
             },
-            array_layer_count: self.layers.len() as u32,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8UnormSrgb,
-            usage: wgpu::TextureUsage::COPY_DST
-                | wgpu::TextureUsage::COPY_SRC
-                | wgpu::TextureUsage::SAMPLED,
+            format: if color::GAMMA_CORRECTION {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
 
         let amount_to_copy = self.layers.len() - amount;
@@ -321,27 +419,51 @@ impl Atlas {
             }
 
             encoder.copy_texture_to_texture(
-                wgpu::TextureCopyView {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
-                    array_layer: i as u32,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::default(),
                 },
-                wgpu::TextureCopyView {
+                wgpu::TexelCopyTextureInfo {
                     texture: &new_texture,
-                    array_layer: i as u32,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::default(),
                 },
                 wgpu::Extent3d {
                     width: SIZE,
                     height: SIZE,
-                    depth: 1,
+                    depth_or_array_layers: 1,
                 },
             );
         }
 
         self.texture = new_texture;
-        self.texture_view = self.texture.create_default_view();
+        self.texture_view =
+            self.texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+
+        self.texture_bind_group =
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iced_wgpu::image texture atlas bind group"),
+                layout: &self.texture_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.texture_view,
+                    ),
+                }],
+            });
     }
 }

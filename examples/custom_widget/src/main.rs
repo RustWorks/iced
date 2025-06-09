@@ -1,102 +1,88 @@
 //! This example showcases a simple native custom widget that draws a circle.
 mod circle {
-    // For now, to implement a custom native widget you will need to add
-    // `iced_native` and `iced_wgpu` to your dependencies.
-    //
-    // Then, you simply need to define your widget type and implement the
-    // `iced_native::Widget` trait with the `iced_wgpu::Renderer`.
-    //
-    // Of course, you can choose to make the implementation renderer-agnostic,
-    // if you wish to, by creating your own `Renderer` trait, which could be
-    // implemented by `iced_wgpu` and other renderers.
-    use iced_graphics::{Backend, Defaults, Primitive, Renderer};
-    use iced_native::{
-        layout, mouse, Background, Color, Element, Hasher, Layout, Length,
-        Point, Size, Widget,
-    };
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::renderer;
+    use iced::advanced::widget::{self, Widget};
+    use iced::border;
+    use iced::mouse;
+    use iced::{Color, Element, Length, Rectangle, Size};
 
     pub struct Circle {
-        radius: u16,
+        radius: f32,
     }
 
     impl Circle {
-        pub fn new(radius: u16) -> Self {
+        pub fn new(radius: f32) -> Self {
             Self { radius }
         }
     }
 
-    impl<Message, B> Widget<Message, Renderer<B>> for Circle
-    where
-        B: Backend,
-    {
-        fn width(&self) -> Length {
-            Length::Shrink
-        }
+    pub fn circle(radius: f32) -> Circle {
+        Circle::new(radius)
+    }
 
-        fn height(&self) -> Length {
-            Length::Shrink
+    impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Circle
+    where
+        Renderer: renderer::Renderer,
+    {
+        fn size(&self) -> Size<Length> {
+            Size {
+                width: Length::Shrink,
+                height: Length::Shrink,
+            }
         }
 
         fn layout(
             &self,
-            _renderer: &Renderer<B>,
+            _tree: &mut widget::Tree,
+            _renderer: &Renderer,
             _limits: &layout::Limits,
         ) -> layout::Node {
-            layout::Node::new(Size::new(
-                f32::from(self.radius) * 2.0,
-                f32::from(self.radius) * 2.0,
-            ))
-        }
-
-        fn hash_layout(&self, state: &mut Hasher) {
-            use std::hash::Hash;
-
-            self.radius.hash(state);
+            layout::Node::new(Size::new(self.radius * 2.0, self.radius * 2.0))
         }
 
         fn draw(
             &self,
-            _renderer: &mut Renderer<B>,
-            _defaults: &Defaults,
+            _state: &widget::Tree,
+            renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
             layout: Layout<'_>,
-            _cursor_position: Point,
-        ) -> (Primitive, mouse::Interaction) {
-            (
-                Primitive::Quad {
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+            renderer.fill_quad(
+                renderer::Quad {
                     bounds: layout.bounds(),
-                    background: Background::Color(Color::BLACK),
-                    border_radius: self.radius,
-                    border_width: 0,
-                    border_color: Color::TRANSPARENT,
+                    border: border::rounded(self.radius),
+                    ..renderer::Quad::default()
                 },
-                mouse::Interaction::default(),
-            )
+                Color::BLACK,
+            );
         }
     }
 
-    impl<'a, Message, B> Into<Element<'a, Message, Renderer<B>>> for Circle
+    impl<Message, Theme, Renderer> From<Circle>
+        for Element<'_, Message, Theme, Renderer>
     where
-        B: Backend,
+        Renderer: renderer::Renderer,
     {
-        fn into(self) -> Element<'a, Message, Renderer<B>> {
-            Element::new(self)
+        fn from(circle: Circle) -> Self {
+            Self::new(circle)
         }
     }
 }
 
-use circle::Circle;
-use iced::{
-    slider, Align, Column, Container, Element, Length, Sandbox, Settings,
-    Slider, Text,
-};
+use circle::circle;
+use iced::widget::{center, column, slider, text};
+use iced::{Center, Element};
 
-pub fn main() {
-    Example::run(Settings::default())
+pub fn main() -> iced::Result {
+    iced::run(Example::update, Example::view)
 }
 
 struct Example {
-    radius: u16,
-    slider: slider::State,
+    radius: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,48 +90,36 @@ enum Message {
     RadiusChanged(f32),
 }
 
-impl Sandbox for Example {
-    type Message = Message;
-
+impl Example {
     fn new() -> Self {
-        Example {
-            radius: 50,
-            slider: slider::State::new(),
-        }
-    }
-
-    fn title(&self) -> String {
-        String::from("Custom widget - Iced")
+        Example { radius: 50.0 }
     }
 
     fn update(&mut self, message: Message) {
         match message {
             Message::RadiusChanged(radius) => {
-                self.radius = radius.round() as u16;
+                self.radius = radius;
             }
         }
     }
 
-    fn view(&mut self) -> Element<Message> {
-        let content = Column::new()
-            .padding(20)
-            .spacing(20)
-            .max_width(500)
-            .align_items(Align::Center)
-            .push(Circle::new(self.radius))
-            .push(Text::new(format!("Radius: {}", self.radius.to_string())))
-            .push(Slider::new(
-                &mut self.slider,
-                1.0..=100.0,
-                f32::from(self.radius),
-                Message::RadiusChanged,
-            ));
+    fn view(&self) -> Element<Message> {
+        let content = column![
+            circle(self.radius),
+            text!("Radius: {:.2}", self.radius),
+            slider(1.0..=100.0, self.radius, Message::RadiusChanged).step(0.01),
+        ]
+        .padding(20)
+        .spacing(20)
+        .max_width(500)
+        .align_x(Center);
 
-        Container::new(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
+        center(content).into()
+    }
+}
+
+impl Default for Example {
+    fn default() -> Self {
+        Self::new()
     }
 }
